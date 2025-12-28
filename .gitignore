@@ -1,26 +1,23 @@
-# eclipse
-bin
-*.launch
-.settings
-.metadata
-.classpath
-.project
+# Gradle files
+.gradle/
+build/
+out/
 
-# idea
-out
+# IDE files
+.idea/
+*.iml
 *.ipr
 *.iws
-*.iml
-.idea
+.vscode/
+.eclipse/
+.settings/
+bin/
 
-# gradle
-build
-.gradle
+# Run folder (logs, saves)
+run/
+logs/
+crash-reports/
 
-# other
-eclipse
-run
-runs
-run-data
-
-repo
+# OS junk
+.DS_Store
+Thumbs.db
