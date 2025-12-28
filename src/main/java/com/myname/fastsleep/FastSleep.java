@@ -1,134 +1,168 @@
 package com.myname.fastsleep;
 
-import com.mojang.logging.LogUtils;
-import net.minecraft.client.Minecraft;
+import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ClientboundSetTimePacket;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.GameRules;
-import net.neoforged.bus.api.IEventBus;
+import net.minecraft.world.level.Level;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.Mod;
-import net.neoforged.neoforge.client.event.RenderGuiEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
-import net.neoforged.neoforge.event.tick.ServerTickEvent;
-import org.slf4j.Logger;
+import net.neoforged.neoforge.event.tick.LevelTickEvent;
 
 import java.util.List;
 
 @Mod("fastsleep")
 public class FastSleep {
 
-    private static final Logger LOGGER = LogUtils.getLogger();
+    // === КОНФИГ ИЗ SLEEPWARP ===
+    private static final int MAX_TICKS_ADDED = 100; 
+    private static final double PLAYER_MULTIPLIER = 1.0; 
+    private static final boolean ACTION_BAR_MESSAGES = true; 
+    private static final boolean USE_SLEEP_PERCENTAGE = true;
 
-    // === НАСТРОЙКИ ===
-    private static final float BASE_TICK_RATE = 20.0f;
-    private static final float MAX_TICK_RATE = 500.0f; 
-    private static final float TARGET_MSPT_USAGE = 0.85f; 
-
-    private boolean isFastSleepActive = false;
+    private static final int DAY_LENGTH_TICKS = 24000;
+    
+    // Состояние
+    private boolean isWarping = false;
     private int originalSleepRule = 100;
 
-    public FastSleep(IEventBus modEventBus) {
+    public FastSleep() {
         NeoForge.EVENT_BUS.register(this);
     }
 
     // Сброс при старте
     @SubscribeEvent
     public void onServerStarted(ServerStartedEvent event) {
-        event.getServer().tickRateManager().setTickRate(BASE_TICK_RATE);
-        isFastSleepActive = false;
+        isWarping = false;
+        // Мы убрали проверку hasRule, так как стандартные правила есть всегда
     }
 
-    // ЛОГИКА СЕРВЕРА
+    /**
+     * Основной цикл. Порт логики SleepWarp.
+     */
     @SubscribeEvent
-    public void onServerTick(ServerTickEvent.Pre event) {
-        MinecraftServer server = event.getServer();
-        if (server.getPlayerList().getPlayerCount() == 0) return;
+    public void onLevelTick(LevelTickEvent.Post event) {
+        if (event.getLevel().isClientSide() || event.getLevel().dimension() != Level.OVERWORLD) return;
 
-        List<ServerPlayer> players = server.getPlayerList().getPlayers();
-        int total = players.size();
-        int sleeping = 0;
+        ServerLevel world = (ServerLevel) event.getLevel();
+        MinecraftServer server = world.getServer();
 
-        for (ServerPlayer player : players) {
-            if (player.isSleeping()) sleeping++;
+        // ИСПРАВЛЕНИЕ 1: RULE_DAYLIGHT вместо RULE_DO_DAYLIGHT_CYCLE
+        if (!world.getServer().isSingleplayer() && !world.getGameRules().getBoolean(GameRules.RULE_DAYLIGHT)) return;
+        
+        List<ServerPlayer> players = world.players();
+        int totalPlayers = players.size();
+        if (totalPlayers == 0) return;
+
+        long sleepingPlayers = players.stream().filter(ServerPlayer::isSleepingLongEnough).count();
+
+        if (sleepingPlayers == 0) {
+            if (isWarping) {
+                stopWarp(world);
+            }
+            return;
         }
 
-        boolean shouldSpeedUp = total > 0 && ((float) sleeping / total) >= 0.5f;
+        if (USE_SLEEP_PERCENTAGE) {
+            int percentRequired = world.getGameRules().getInt(GameRules.RULE_PLAYERS_SLEEPING_PERCENTAGE);
+            int minimumSleeping = Math.max(1, Mth.ceil((totalPlayers * percentRequired) / 100.0F));
+            if (sleepingPlayers < minimumSleeping) return;
+        }
 
-        if (shouldSpeedUp) {
-            if (!isFastSleepActive) {
-                isFastSleepActive = true;
-                GameRules rules = server.getGameRules();
-                originalSleepRule = rules.getInt(GameRules.RULE_PLAYERS_SLEEPING_PERCENTAGE);
-                rules.getRule(GameRules.RULE_PLAYERS_SLEEPING_PERCENTAGE).set(101, server);
+        // == НАЧАЛО ВАРПА ==
+        if (!isWarping) {
+            startWarp(world);
+        }
+
+        // 2. Математика расчета скорости
+        long worldTime = world.getDayTime() % DAY_LENGTH_TICKS;
+        int warpTickCount;
+
+        if (worldTime + MAX_TICKS_ADDED < DAY_LENGTH_TICKS) {
+            if (totalPlayers == 1) {
+                warpTickCount = MAX_TICKS_ADDED;
+            } else {
+                double sleepingRatio = (double) sleepingPlayers / totalPlayers;
+                double scaledRatio = sleepingRatio * PLAYER_MULTIPLIER;
+                double tickMultiplier = scaledRatio / ((scaledRatio * 2) - PLAYER_MULTIPLIER - sleepingRatio + 1);
+                warpTickCount = Math.toIntExact(Math.round(MAX_TICKS_ADDED * tickMultiplier));
             }
-
-            float averageTickTimeMs = server.getAverageTickTimeNanos() / 1_000_000.0f;
-            if (averageTickTimeMs < 0.5f) averageTickTimeMs = 0.5f;
-
-            float theoreticalRate = (1000.0f / averageTickTimeMs) * TARGET_MSPT_USAGE;
-            float targetRate = Mth.clamp(theoreticalRate, BASE_TICK_RATE, MAX_TICK_RATE);
-            
-            float currentRate = server.tickRateManager().tickrate();
-            // Плавный разгон
-            float smoothRate = Mth.lerp(0.1f, currentRate, targetRate); 
-
-            server.tickRateManager().setTickRate(smoothRate);
-
         } else {
-            if (isFastSleepActive) {
-                isFastSleepActive = false;
-                server.tickRateManager().setTickRate(BASE_TICK_RATE);
-                server.getGameRules().getRule(GameRules.RULE_PLAYERS_SLEEPING_PERCENTAGE).set(originalSleepRule, server);
-            }
-            if (server.tickRateManager().tickrate() > 20.1f) {
-                server.tickRateManager().setTickRate(BASE_TICK_RATE);
-            }
+            warpTickCount = Math.toIntExact(DAY_LENGTH_TICKS % worldTime);
+        }
+
+        // 3. ИСПОЛНЕНИЕ (Крутим время)
+        long currentTime = world.getDayTime();
+        world.setDayTime(currentTime + warpTickCount);
+
+        // ИСПРАВЛЕНИЕ 2: RULE_DAYLIGHT
+        boolean doDaylightCycle = world.getGameRules().getBoolean(GameRules.RULE_DAYLIGHT);
+        ClientboundSetTimePacket packet = new ClientboundSetTimePacket(world.getGameTime(), world.getDayTime(), doDaylightCycle);
+        server.getPlayerList().broadcastAll(packet, world.dimension());
+
+        // 4. Визуал (Action Bar)
+        if (ACTION_BAR_MESSAGES) {
+            sendActionBar(world, sleepingPlayers, totalPlayers, warpTickCount);
+        }
+        
+        // Если наступило утро
+        long newTime = world.getDayTime() % DAY_LENGTH_TICKS;
+        if (newTime < 1000 && worldTime > 20000) {
+             stopWarp(world);
+             for(ServerPlayer p : players) {
+                 if(p.isSleeping()) p.stopSleeping();
+             }
         }
     }
 
-    // ОТРИСОВКА (HUD)
-    // RenderGuiEvent.Post рисует поверх всего, игнорируя скрытый интерфейс
-    @SubscribeEvent
-    public void onRenderGuiPost(RenderGuiEvent.Post event) {
-        Minecraft mc = Minecraft.getInstance();
-        if (mc.player == null || mc.level == null) return;
+    private void startWarp(ServerLevel world) {
+        isWarping = true;
+        GameRules rules = world.getGameRules();
+        originalSleepRule = rules.getInt(GameRules.RULE_PLAYERS_SLEEPING_PERCENTAGE);
+        rules.getRule(GameRules.RULE_PLAYERS_SLEEPING_PERCENTAGE).set(101, world.getServer());
+    }
 
-        boolean isSleeping = mc.player.isSleeping();
-        float currentRate = mc.level.tickRateManager().tickrate();
-        boolean isSpeeding = currentRate > 21.0f;
+    private void stopWarp(ServerLevel world) {
+        isWarping = false;
+        world.getGameRules().getRule(GameRules.RULE_PLAYERS_SLEEPING_PERCENTAGE).set(originalSleepRule, world.getServer());
+    }
 
-        if (isSleeping || isSpeeding) {
-            var guiGraphics = event.getGuiGraphics();
-            int width = guiGraphics.guiWidth();
-            int height = guiGraphics.guiHeight();
-            
-            int centerX = width / 2;
-            int yPos = height / 2 - 40; // Чуть выше центра, над кнопкой "Встать"
+    private void sendActionBar(ServerLevel world, long sleepingPlayers, int totalPlayers, int warpTickCount) {
+        long worldTime = world.getDayTime() % DAY_LENGTH_TICKS;
+        long remainingTicks = DAY_LENGTH_TICKS - worldTime;
+        
+        if (remainingTicks < 0) remainingTicks = 0;
 
-            // --- ВРЕМЯ ---
-            long time = mc.level.getDayTime();
-            long hour = ((time / 1000 + 6) % 24);
-            long minute = (time % 1000) * 60 / 1000;
-            String timeStr = String.format("%02d:%02d", hour, minute);
-            
-            // Рисуем обычным шрифтом, но жирным и ярким
-            guiGraphics.drawCenteredString(mc.font, Component.literal("Time: " + timeStr).withStyle(s -> s.withBold(true)), centerX, yPos, 0xFFAA00);
+        Component text;
 
-            // --- СКОРОСТЬ ---
-            int multiplier = Math.round(currentRate / 20.0f);
-            
-            if (multiplier <= 1 && isSleeping) {
-                guiGraphics.drawCenteredString(mc.font, Component.literal("Accelerating..."), centerX, yPos + 15, 0xAAAAAA);
-            } 
-            else if (multiplier > 1) {
-                int color = (multiplier > 15) ? 0xFF5555 : 0x55FF55;
-                String speedStr = String.format(">>> %dx Speed <<<", multiplier);
-                guiGraphics.drawCenteredString(mc.font, Component.literal(speedStr).withStyle(s -> s.withBold(true)), centerX, yPos + 15, color);
-            }
+        if (totalPlayers > 1) {
+            ChatFormatting color = ChatFormatting.DARK_GREEN;
+            text = Component.literal("⌛ ")
+                    .withStyle(ChatFormatting.GOLD)
+                    .append(Component.literal(sleepingPlayers + "/" + totalPlayers + " sleeping. ")
+                    .withStyle(color));
+        } else {
+            text = Component.literal("⌛ ").withStyle(ChatFormatting.GOLD);
+        }
+
+        // Расчет секунд до утра
+        long ticksPerSecond = 20 * (Math.max(1, warpTickCount / 10)); 
+        if (ticksPerSecond == 0) ticksPerSecond = 20; // Защита от деления на 0
+        
+        long realSecondsLeft = remainingTicks / ticksPerSecond; 
+        if (realSecondsLeft < 0) realSecondsLeft = 0;
+
+        text = text.copy().append(Component.literal("Time until dawn: " + realSecondsLeft + "s")
+                   .withStyle(ChatFormatting.YELLOW));
+
+        for (ServerPlayer player : world.players()) {
+            player.sendSystemMessage(text, true); 
         }
     }
 }
